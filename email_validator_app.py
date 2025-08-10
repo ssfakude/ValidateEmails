@@ -385,58 +385,83 @@ class EmailValidator:
         except Exception:
             return False, "Could not determine"
     
-    def smtp_validate(self, email: str) -> Tuple[bool, str]:
+    def get_all_mx(self, domain: str) -> List[str]:
+        """Return a list of MX hostnames for the domain (sorted by preference)."""
+        try:
+            answers = dns.resolver.resolve(domain, 'MX')
+            hosts = []
+            for rdata in answers:
+                try:
+                    priority = getattr(rdata, 'preference', 10)
+                    host = str(rdata.exchange).rstrip('.')
+                    hosts.append((priority, host))
+                except Exception:
+                    continue
+            hosts.sort(key=lambda x: x[0])
+            return [h for _, h in hosts]
+        except Exception:
+            # Fall back to single MX from existing method (already cached there)
+            has_mx, mx_host, _ = self.get_mx_record(domain)
+            if has_mx and mx_host:
+                return [mx_host]
+            return []
+
+    def smtp_probe(self, email: str) -> Tuple[str, str]:
         """
-        Enhanced SMTP validation with detailed responses
-        
-        Args:
-            email (str): Email address to validate
-            
+        Tri-state SMTP probe.
         Returns:
-            Tuple[bool, str]: (is_valid, detail)
+            (status, detail) where status in {'valid','invalid','unknown'}
         """
+        # Basic format and MX pre-checks
         format_valid, format_detail = self.validate_email_format(email)
         if not format_valid:
-            return False, format_detail
-        
+            return 'invalid', format_detail
         domain = email.split('@')[1]
-        has_mx, mx_record, mx_detail = self.get_mx_record(domain)
-        
-        if not has_mx:
-            return False, mx_detail
-        
-        try:
-            # Connect to SMTP server
-            server = smtplib.SMTP(timeout=self.timeout)
-            server.connect(mx_record, 25)
-            server.helo('validator.com')
-            server.mail('test@validator.com')
-            
-            # Check if email exists
-            code, message = server.rcpt(email)
-            server.quit()
-            
-            if code == 250:
-                return True, "SMTP verification successful"
-            elif code == 550:
-                return False, "Email address not found (550)"
-            elif code == 551:
-                return False, "User not local (551)"
-            elif code == 552:
-                return False, "Mailbox full (552)"
-            elif code == 553:
-                return False, "Invalid email format (553)"
-            else:
-                return False, f"SMTP error code: {code}"
-            
-        except smtplib.SMTPServerDisconnected:
-            return False, "SMTP server disconnected"
-        except smtplib.SMTPRecipientsRefused:
-            return False, "Email address refused by server"
-        except socket.timeout:
-            return False, "SMTP connection timeout"
-        except Exception as e:
-            return False, f"SMTP validation failed: {str(e)[:50]}"
+        mx_hosts = self.get_all_mx(domain)
+        if not mx_hosts:
+            return 'invalid', 'No MX record'
+
+        from_address = 'probe@validator.com'
+        # Try each MX host until a definitive answer or all exhausted
+        for mx in mx_hosts:
+            try:
+                server = smtplib.SMTP(timeout=self.timeout)
+                server.connect(mx, 25)
+                try:
+                    server.ehlo_or_helo_if_needed()
+                except Exception:
+                    pass
+                # Attempt STARTTLS if offered
+                try:
+                    if server.has_extn('starttls'):
+                        server.starttls(timeout=self.timeout)
+                        server.ehlo()
+                except Exception:
+                    # STARTTLS failure isn't fatal for probing
+                    pass
+                server.mail(from_address)
+                code, _ = server.rcpt(email)
+                server.quit()
+                if code == 250:
+                    return 'valid', f'SMTP accepted RCPT on {mx}'
+                elif code in (550, 551, 552, 553, 554):
+                    return 'invalid', f'SMTP hard failure {code} on {mx}'
+                else:
+                    # Soft / ambiguous code, try next MX
+                    continue
+            except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, smtplib.SMTPHeloError):
+                # Try next server
+                continue
+            except smtplib.SMTPRecipientsRefused:
+                return 'invalid', 'Recipient refused'
+            except (socket.timeout, smtplib.SMTPDataError):
+                # Timeout or data error ambiguous -> try next
+                continue
+            except Exception as e:
+                # Unknown error; continue trying others
+                continue
+        # If we got here, no definitive answer
+        return 'unknown', 'Could not verify (all MX ambiguous or timed out)'
     
     def validate_email(self, email: str) -> Tuple[bool, str, Dict]:
         """
@@ -457,7 +482,8 @@ class EmailValidator:
             'format_valid': False,
             'domain_exists': False,
             'has_mx_record': False,
-            'smtp_valid': False,
+            'smtp_valid': False,      # Backwards compatibility boolean
+            'smtp_status': None,      # 'valid' | 'invalid' | 'unknown' | None
             'is_disposable': False,
             'is_role_based': False,
             'is_catch_all': False,
@@ -503,19 +529,21 @@ class EmailValidator:
         
         # 6. SMTP validation (if enabled)
         if self.smtp_check and has_mx:
-            smtp_valid, smtp_detail = self.smtp_validate(email)
-            results['smtp_valid'] = smtp_valid
+            smtp_status, smtp_detail = self.smtp_probe(email)
+            results['smtp_status'] = smtp_status
+            results['smtp_valid'] = (smtp_status == 'valid')
             results['details'].append(f"SMTP: {smtp_detail}")
-            
-            # 7. Catch-all domain check (only if SMTP is enabled)
+
+            # 7. Catch-all domain check (only if SMTP is enabled and status not invalid)
             is_catch_all, catch_all_detail = self.check_catch_all_domain(domain)
             results['is_catch_all'] = is_catch_all
             results['details'].append(f"Catch-all: {catch_all_detail}")
-            
-            if not smtp_valid:
+
+            if smtp_status == 'invalid':
                 return False, smtp_detail, results
-            
-            return True, "Valid (SMTP verified)", results
+            if smtp_status == 'valid':
+                return True, "Valid (SMTP verified)", results
+            # unknown falls through to be treated separately in aggregation
         
         # If SMTP check is disabled, base validity on format, domain, and MX
         if not domain_exists:
@@ -540,9 +568,10 @@ class EmailValidator:
         """
         if email_column not in df.columns:
             raise ValueError(f"Column '{email_column}' not found in file")
-        
+
         valid_emails = []
         bounced_emails = []
+        unknown_emails = []
         total_emails = len(df)
         
         # Enhanced counters
@@ -551,6 +580,7 @@ class EmailValidator:
             'domain_errors': 0,
             'mx_errors': 0,
             'smtp_errors': 0,
+            'smtp_unknown': 0,
             'disposable_emails': 0,
             'role_based_emails': 0,
             'catch_all_domains': 0
@@ -566,8 +596,12 @@ class EmailValidator:
                 stats['domain_errors'] += 1
             if not detailed_results.get('has_mx_record', False):
                 stats['mx_errors'] += 1
-            if self.smtp_check and not detailed_results.get('smtp_valid', False):
-                stats['smtp_errors'] += 1
+            if self.smtp_check:
+                smtp_status = detailed_results.get('smtp_status')
+                if smtp_status == 'invalid':
+                    stats['smtp_errors'] += 1
+                elif smtp_status == 'unknown':
+                    stats['smtp_unknown'] += 1
             if detailed_results.get('is_disposable', False):
                 stats['disposable_emails'] += 1
             if detailed_results.get('is_role_based', False):
@@ -589,7 +623,9 @@ class EmailValidator:
                 'details': '; '.join(detailed_results.get('details', []))
             }
             
-            if is_valid:
+            if self.smtp_check and detailed_results.get('smtp_status') == 'unknown':
+                unknown_emails.append(email_info)
+            elif is_valid:
                 valid_emails.append(email_info)
             else:
                 bounced_emails.append(email_info)
@@ -603,8 +639,10 @@ class EmailValidator:
             'total': len(df),
             'valid': valid_emails,
             'bounced': bounced_emails,
+            'unknown': unknown_emails,
             'valid_count': len(valid_emails),
             'bounced_count': len(bounced_emails),
+            'unknown_count': len(unknown_emails),
             'statistics': stats,
             'validation_settings': {
                 'smtp_check': self.smtp_check,
@@ -840,7 +878,11 @@ def main():
                     st.header("📊 Enhanced Validation Results")
                     
                     # Summary metrics
-                    col1, col2, col3, col4 = st.columns(4)
+                    # Adjust metrics to show unknown when SMTP enabled
+                    if smtp_check:
+                        col1, col2, col3, col4, col5 = st.columns(5)
+                    else:
+                        col1, col2, col3, col4 = st.columns(4)
                     
                     with col1:
                         st.metric("Total Emails", results['total'])
@@ -850,10 +892,16 @@ def main():
                     
                     with col3:
                         st.metric("Invalid Emails", results['bounced_count'])
-                    
-                    with col4:
-                        valid_rate = (results['valid_count'] / results['total'] * 100) if results['total'] > 0 else 0
-                        st.metric("Valid Rate", f"{valid_rate:.1f}%")
+                    if smtp_check:
+                        with col4:
+                            st.metric("Unknown Emails", results.get('unknown_count', 0))
+                        with col5:
+                            valid_rate = (results['valid_count'] / results['total'] * 100) if results['total'] > 0 else 0
+                            st.metric("Valid Rate", f"{valid_rate:.1f}%")
+                    else:
+                        with col4:
+                            valid_rate = (results['valid_count'] / results['total'] * 100) if results['total'] > 0 else 0
+                            st.metric("Valid Rate", f"{valid_rate:.1f}%")
                     
                     st.info(f"⏱️ Validation completed in {duration:.2f} seconds")
                     
@@ -862,7 +910,10 @@ def main():
                         st.subheader("📈 Detailed Statistics")
                         stats = results['statistics']
                         
-                        col1, col2, col3, col4 = st.columns(4)
+                        if smtp_check:
+                            col1, col2, col3, col4, col5 = st.columns(5)
+                        else:
+                            col1, col2, col3, col4 = st.columns(4)
                         with col1:
                             st.metric("Format Errors", stats['format_errors'])
                             st.metric("Domain Errors", stats['domain_errors'])
@@ -875,12 +926,20 @@ def main():
                                 st.metric("Disposable Emails", stats['disposable_emails'])
                             if check_role_based:
                                 st.metric("Role-based Emails", stats['role_based_emails'])
-                        with col4:
-                            if smtp_check:
+                        if smtp_check:
+                            with col4:
                                 st.metric("Catch-all Domains", stats['catch_all_domains'])
+                            with col5:
+                                st.metric("SMTP Unknown", stats.get('smtp_unknown', 0))
+                        else:
+                            with col4:
+                                pass
                     
                     # Show detailed results
-                    tab1, tab2, tab3, tab4 = st.tabs(["✅ Valid Emails", "❌ Invalid Emails", "� Detailed Analysis", "�📈 Summary"])
+                    if smtp_check:
+                        tab1, tab2, tab_unknown, tab3, tab4 = st.tabs(["✅ Valid", "❌ Invalid", "❓ Unknown", "🔍 Details", "📈 Summary"])
+                    else:
+                        tab1, tab2, tab3, tab4 = st.tabs(["✅ Valid Emails", "❌ Invalid Emails", "🔍 Detailed Analysis", "📈 Summary"])
                     
                     with tab1:
                         if results['valid']:
@@ -924,11 +983,25 @@ def main():
                         else:
                             st.info("No invalid emails found.")
                     
-                    with tab3:
+                    if smtp_check:
+                        with tab_unknown:
+                            if results.get('unknown'):
+                                unknown_df = pd.DataFrame(results['unknown'])
+                                st.dataframe(unknown_df, use_container_width=True)
+                                create_download_link(
+                                    unknown_df,
+                                    "unknown_emails_enhanced.csv",
+                                    "📥 Download Unknown Emails (Enhanced)"
+                                )
+                            else:
+                                st.info("No unknown emails.")
+                    
+                    # Detailed analysis tab
+                    with (tab3 if not smtp_check else tab3):
                         st.subheader("🔍 Detailed Validation Analysis")
                         
                         # Combine all results for detailed analysis
-                        all_emails = results['valid'] + results['bounced']
+                        all_emails = results['valid'] + results['bounced'] + (results.get('unknown') or [])
                         if all_emails:
                             analysis_df = pd.DataFrame(all_emails)
                             
@@ -969,17 +1042,26 @@ def main():
                                     st.write(f"✅ SMTP verified: {smtp_valid}/{len(analysis_df)}")
                     
                     with tab4:
+                        summary_base_metrics = ['Total Emails', 'Valid Emails', 'Invalid Emails']
+                        summary_base_values = [
+                            results['total'],
+                            results['valid_count'],
+                            results['bounced_count']
+                        ]
+                        if smtp_check:
+                            summary_base_metrics.append('Unknown Emails')
+                            summary_base_values.append(results.get('unknown_count', 0))
+                        summary_base_metrics.append('Valid Rate (%)')
+                        summary_base_values.append(round(valid_rate, 2))
+                        summary_base_metrics.extend(['Format Errors', 'Domain Errors', 'MX Errors'])
+                        summary_base_values.extend([
+                            stats.get('format_errors', 0),
+                            stats.get('domain_errors', 0),
+                            stats.get('mx_errors', 0)
+                        ])
                         summary_data = {
-                            'Metric': ['Total Emails', 'Valid Emails', 'Invalid Emails', 'Valid Rate (%)', 'Format Errors', 'Domain Errors', 'MX Errors'],
-                            'Value': [
-                                results['total'],
-                                results['valid_count'],
-                                results['bounced_count'],
-                                round(valid_rate, 2),
-                                stats.get('format_errors', 0),
-                                stats.get('domain_errors', 0),
-                                stats.get('mx_errors', 0)
-                            ]
+                            'Metric': summary_base_metrics,
+                            'Value': summary_base_values
                         }
                         
                         if smtp_check:
@@ -1010,8 +1092,8 @@ def main():
                         
                         with col1:
                             chart_data = pd.DataFrame({
-                                'Status': ['Valid', 'Invalid'],
-                                'Count': [results['valid_count'], results['bounced_count']]
+                                'Status': ['Valid', 'Invalid'] + (['Unknown'] if smtp_check else []),
+                                'Count': [results['valid_count'], results['bounced_count']] + ([results.get('unknown_count', 0)] if smtp_check else [])
                             })
                             st.bar_chart(chart_data.set_index('Status'))
                         
